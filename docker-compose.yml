@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-namenode
+    environment:
+      - CLUSTER_NAME=test
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    ports:
+      - "9870:9870"  # Web UI NameNode
+      - "9000:9000"  # HDFS port
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+    networks:
+      - hdfs-network
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-datanode
+    environment:
+      - CLUSTER_NAME=test
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    ports:
+      - "9864:9864"  # Web UI DataNode
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+    depends_on:
+      - namenode
+    networks:
+      - hdfs-network
+
+volumes:
+  hdfs_namenode:
+  hdfs_datanode:
+
+networks:
+  hdfs-network:
+    driver: bridge
