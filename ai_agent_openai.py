@@ -113,7 +113,7 @@ async def main():
                     print("Обработка...", end="\r")
                     response = await agent.process_request(user_input)
                     print(" " * 20, end="\r")
-                    print(f"Ответ: {response}\n")
+                    print(f"Ответ:\n{response}\n")
 
                 except KeyboardInterrupt:
                     print("\nВыход...")
