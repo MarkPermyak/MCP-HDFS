@@ -13,7 +13,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen/qwen3-32b")
 MCP_SERVER_URL = "http://127.0.0.1:8000/sse"
 
-
 # Инструменты, требующие подтверждения
 HIGH_RISK_TOOLS = {
     "hdfs_chmod": "Изменение прав доступа может нарушить доступ к файлам",
@@ -21,6 +20,7 @@ HIGH_RISK_TOOLS = {
     "hdfs_snapshot_delete": "Удаление snapshot необратимо",
     "hdfs_upload": "Файл может перезаписать существующие данные",
 }
+
 
 class MCPAgent:
     def __init__(self, require_confirmation=True):
@@ -57,6 +57,7 @@ class MCPAgent:
 
     async def process_request(self, user_message):
         tools = self._convert_tools_for_openai()
+        tool_names = [t["function"]["name"] for t in tools]
 
         response = await self.client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -64,9 +65,19 @@ class MCPAgent:
                 {
                     "role": "system",
                     "content": (
-                        "Ты — AI-ассистент с доступом к инструментам. "
-                        "Если запрос требует работы с файлами, данными или вычислений — используй инструменты. "
-                        "Если можешь ответить сам — отвечай без инструментов."
+                        "Ты — AI-ассистент для управления HDFS кластером через MCP инструменты.\n\n"
+                        "ОГРАНИЧЕНИЯ:\n"
+                        f"- У тебя есть строгий список доступных команд: {', '.join(tool_names)}\n"
+                        "- Ты НЕ можешь выполнять команды, которых нет в этом списке\n"
+                        "- Если запрос не соответствует доступным инструментам — честно скажи, что не можешь это сделать\n"
+                        "- Не выдумывай команды и не обещай выполнить то, что недоступно\n\n"
+                        "ТРЕБОВАНИЯ К ОТВЕТУ:\n"
+                        "- После выполнения любой операции выводи краткий отчет: что сделано, какой результат\n"
+                        "- Если были ошибки — сообщи о них четко\n"
+                        "- Для сложных операций (загрузка, snapshot, квоты) — пиши план: что было → что стало\n\n"
+                        "БЕЗОПАСНОСТЬ:\n"
+                        "- Некоторые операции требуют подтверждения пользователя\n"
+                        "- Если операция опасная — запроси подтверждение перед выполнением"
                     )
                 },
                 {"role": "user", "content": user_message}
@@ -88,7 +99,7 @@ class MCPAgent:
 
             # Проверка подтверждения
             if not self._ask_confirmation(func_name, func_args):
-                return "Операция отменена пользователем"
+                return "ОПЕРАЦИЯ ОТМЕНЕНА\n\nПользователь не подтвердил выполнение операции."
 
             print(f"Вызов инструмента: {func_name}")
             print(f"Аргументы: {func_args}")
@@ -96,8 +107,12 @@ class MCPAgent:
             result = await self.session.call_tool(func_name, arguments=func_args)
             tool_result = result.content[0].text
 
-            return tool_result
+            # Формируем отчет
+            report = f"ОПЕРАЦИЯ ВЫПОЛНЕНА\n\nИнструмент: {func_name}\nРезультат:\n{tool_result}"
+            
+            return report
         else:
+            # Если инструменты не нужны — возвращаем ответ LLM
             return message.content
 
     def _convert_tools_for_openai(self):
