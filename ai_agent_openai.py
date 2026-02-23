@@ -9,19 +9,51 @@ from openai import AsyncOpenAI
 load_dotenv()
 
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "llama3.2")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen/qwen3-32b")
 MCP_SERVER_URL = "http://127.0.0.1:8000/sse"
 
 
+# Инструменты, требующие подтверждения
+HIGH_RISK_TOOLS = {
+    "hdfs_chmod": "Изменение прав доступа может нарушить доступ к файлам",
+    "hdfs_chown": "Изменение владельца может нарушить права доступа",
+    "hdfs_snapshot_delete": "Удаление snapshot необратимо",
+    "hdfs_upload": "Файл может перезаписать существующие данные",
+}
+
 class MCPAgent:
-    def __init__(self):
+    def __init__(self, require_confirmation=True):
         self.session = None
         self.tools = []
         self.client = AsyncOpenAI(
             base_url=OPENAI_BASE_URL,
             api_key=OPENAI_API_KEY
         )
+        self.require_confirmation = require_confirmation
+
+    def _needs_confirmation(self, tool_name):
+        if tool_name in HIGH_RISK_TOOLS:
+            return "high"
+        return None
+
+    def _ask_confirmation(self, tool_name, func_args):
+        risk_level = self._needs_confirmation(tool_name)
+        if not risk_level:
+            return True
+
+        reason = HIGH_RISK_TOOLS.get(tool_name)
+        
+        print(f"\n⚠️  ОПАСНАЯ ОПЕРАЦИЯ")
+        print(f"Инструмент: {tool_name}")
+        print(f"Аргументы: {func_args}")
+        print(f"Причина: {reason}")
+        
+        if self.require_confirmation:
+            response = input("\nВыполнить? (y/n): ").strip().lower()
+            return response in ['y', 'yes', 'да']
+        
+        return True
 
     async def process_request(self, user_message):
         tools = self._convert_tools_for_openai()
@@ -53,6 +85,10 @@ class MCPAgent:
                 func_args = json.loads(tool_call.function.arguments)
             except:
                 func_args = eval(tool_call.function.arguments)
+
+            # Проверка подтверждения
+            if not self._ask_confirmation(func_name, func_args):
+                return "Операция отменена пользователем"
 
             print(f"Вызов инструмента: {func_name}")
             print(f"Аргументы: {func_args}")
