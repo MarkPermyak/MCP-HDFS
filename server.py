@@ -5,22 +5,138 @@ import os
 import subprocess
 import json
 import logging
+import time
+import functools
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 
 mcp = FastMCP("File System Server")
 
 HDFS_NAMENODE = os.getenv("HDFS_NAMENODE", "http://localhost:9870")
 HDFS_USER = os.getenv("HDFS_USER", "root")
 AUDIT_LOG_FILE = os.getenv("AUDIT_LOG_FILE", "hdfs_audit.log")
+SERVER_LOG_FILE = os.getenv("SERVER_LOG_FILE", "hdfs_server.log")
 
-# Настройка логгера аудита
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "1.0"))   
+RETRY_MAX_DELAY = float(os.getenv("RETRY_MAX_DELAY", "30.0"))    
+RETRY_BACKOFF_FACTOR = float(os.getenv("RETRY_BACKOFF_FACTOR", "2.0"))
+HDFS_CALL_TIMEOUT = int(os.getenv("HDFS_CALL_TIMEOUT", "30"))    
+HDFS_CMD_TIMEOUT = int(os.getenv("HDFS_CMD_TIMEOUT", "300"))     
+
 audit_logger = logging.getLogger("hdfs_audit")
 audit_logger.setLevel(logging.INFO)
+audit_logger.propagate = False
 
-file_handler = logging.FileHandler(AUDIT_LOG_FILE, encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(message)s"))
-audit_logger.addHandler(file_handler)
+_audit_handler = logging.FileHandler(AUDIT_LOG_FILE, encoding="utf-8")
+_audit_handler.setFormatter(logging.Formatter("%(message)s"))
+audit_logger.addHandler(_audit_handler)
+
+logger = logging.getLogger("hdfs_server")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+_server_handler = logging.FileHandler(SERVER_LOG_FILE, encoding="utf-8")
+_server_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logger.addHandler(_server_handler)
+
+
+class RetryExhaustedError(Exception):
+    """Все попытки retry исчерпаны."""
+    pass
+
+
+class DeadlineExceededError(Exception):
+    """Превышен общий дедлайн операции."""
+    pass
+
+
+def retry_with_backoff(
+    max_attempts: int = RETRY_MAX_ATTEMPTS,
+    base_delay: float = RETRY_BASE_DELAY,
+    max_delay: float = RETRY_MAX_DELAY,
+    backoff_factor: float = RETRY_BACKOFF_FACTOR,
+    deadline: Optional[float] = None,           
+    retriable_exceptions: tuple = (Exception,),
+    operation_name: Optional[str] = None,        
+):
+    """
+    Декоратор для синхронных функций.
+    Повторяет вызов при исключениях с экспоненциальной задержкой.
+
+    Args:
+        max_attempts:          максимум попыток (включая первую)
+        base_delay:            начальная задержка в секундах
+        max_delay:             максимальная задержка между попытками
+        backoff_factor:        множитель задержки (delay *= backoff_factor^attempt)
+        deadline:              абсолютный monotonic timestamp крайнего срока (None = без дедлайна)
+        retriable_exceptions:  кортеж типов исключений, при которых делать retry
+        operation_name:        имя операции для логов (если None — берётся func.__name__)
+    """
+    def decorator(func: Callable):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            name = operation_name or func.__name__
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise DeadlineExceededError(
+                        f"Дедлайн превышен до выполнения попытки {attempt} для '{name}'"
+                    )
+
+                try:
+                    return func(*args, **kwargs)
+                except retriable_exceptions as exc:
+                    last_exc = exc
+                    if attempt == max_attempts:
+                        break
+
+                    delay = min(base_delay * (backoff_factor ** (attempt - 1)), max_delay)
+
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise DeadlineExceededError(
+                                f"Дедлайн превышен после попытки {attempt} для '{name}'"
+                            ) from exc
+                        delay = min(delay, remaining)
+
+                    logger.warning(
+                        f"[retry] '{name}' попытка {attempt}/{max_attempts} "
+                        f"завершилась ошибкой: {exc}. "
+                        f"Следующая попытка через {delay:.2f}s"
+                    )
+                    time.sleep(delay)
+
+            raise RetryExhaustedError(
+                f"'{name}' не выполнена за {max_attempts} попыток. "
+                f"Последняя ошибка: {last_exc}"
+            ) from last_exc
+
+        return wrapper
+    return decorator
+
+
+def with_timeout(timeout: float):
+    """
+    Декоратор-обёртка для синхронных функций: выполняет их в отдельном потоке
+    через concurrent.futures и бросает TimeoutError если превышен timeout.
+    """
+    import concurrent.futures
+
+    def decorator(func: Callable):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(func, *args, **kwargs)
+                try:
+                    return future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    raise TimeoutError(
+                        f"Функция '{func.__name__}' превысила таймаут {timeout}s"
+                    )
+        return wrapper
+    return decorator
 
 
 def get_hdfs_client():
@@ -34,7 +150,7 @@ def log_audit(
     permission_diff: Optional[Dict[str, Any]] = None,
     status: str = "SUCCESS"
 ):
-    """Записывает операцию в аудит-лог"""
+    """Записывает операцию в аудит-лог."""
     log_entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "operation": operation,
@@ -47,32 +163,97 @@ def log_audit(
 
 
 def get_hdfs_status(path: str) -> Optional[Dict[str, Any]]:
-    """Получает текущий статус файла/директории для аудита"""
-    try:
+    """Получает текущий статус файла/директории для аудита (с retry)."""
+    @retry_with_backoff(max_attempts=RETRY_MAX_ATTEMPTS)
+    @with_timeout(HDFS_CALL_TIMEOUT)
+    def _get():
         client = get_hdfs_client()
         return client.status(path, strict=False)
-    except:
+
+    try:
+        return _get()
+    except Exception:
         return None
+
+
+def run_hdfs_command(command):
+    """Выполняет shell-команду внутри Docker-контейнера namenode."""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-it", "hdfs-namenode"] + command,
+            capture_output=True,
+            text=True,
+            timeout=HDFS_CMD_TIMEOUT
+        )
+        return result.stdout.strip() if result.returncode == 0 else f"Ошибка: {result.stderr.strip()}"
+    except subprocess.TimeoutExpired:
+        return f"Ошибка: Превышено время выполнения команды ({HDFS_CMD_TIMEOUT}s)"
+    except Exception as e:
+        return f"Ошибка выполнения: {str(e)}"
+
+
+def hdfs_operation(
+    operation_name: str,
+    func: Callable,
+    user: str,
+    context: Dict[str, Any],
+    permission_diff_fn: Optional[Callable] = None,
+    deadline_seconds: Optional[float] = None,
+):
+    """
+    Выполняет HDFS-операцию с retry/backoff/timeout/deadline.
+
+    Args:
+        operation_name:    имя операции для аудита
+        func:              функция, выполняющая саму операцию (без аргументов)
+        user:              текущий пользователь
+        context:           контекст для аудита
+        permission_diff_fn: опционально — callable, возвращающий permission_diff
+        deadline_seconds:  дедлайн в секундах с момента вызова
+    """
+    deadline_ts = (time.monotonic() + deadline_seconds) if deadline_seconds else None
+
+    @retry_with_backoff(
+        max_attempts=RETRY_MAX_ATTEMPTS,
+        deadline=deadline_ts,
+        operation_name=operation_name,
+    )
+    @with_timeout(HDFS_CALL_TIMEOUT)
+    def _execute():
+        return func()
+
+    try:
+        result = _execute()
+        perm_diff = permission_diff_fn() if permission_diff_fn else None
+        log_audit(operation_name, user, context, permission_diff=perm_diff)
+        return result
+    except DeadlineExceededError as e:
+        log_audit(operation_name, user, context, status=f"DEADLINE_EXCEEDED: {e}")
+        return f"Ошибка: дедлайн операции превышен. {e}"
+    except RetryExhaustedError as e:
+        log_audit(operation_name, user, context, status=f"RETRY_EXHAUSTED: {e}")
+        return f"Ошибка: все попытки исчерпаны. {e}"
+    except TimeoutError as e:
+        log_audit(operation_name, user, context, status=f"TIMEOUT: {e}")
+        return f"Ошибка: таймаут операции. {e}"
+    except Exception as e:
+        log_audit(operation_name, user, context, status=f"ERROR: {str(e)}")
+        return f"Ошибка HDFS: {str(e)}"
 
 
 @mcp.tool()
 def hdfs_list(path: str) -> str:
     user = HDFS_USER
     context = {"path": path}
-    
-    try:
+
+    def _op():
         client = get_hdfs_client()
         status = client.status(path, strict=False)
-
         if status is None:
-            log_audit("hdfs_list", user, context, status="NOT_FOUND")
             return f"Путь '{path}' не существует в HDFS."
-
         if status['type'] == 'FILE':
             size = status.get('length', 0)
-            log_audit("hdfs_list", user, context)
             return f"[FILE] {status['pathSuffix']} ({size} bytes)"
-
         items = client.list(path, status=True)
         result = []
         for name, info in items:
@@ -81,27 +262,21 @@ def hdfs_list(path: str) -> str:
             else:
                 size = info.get('length', 0)
                 result.append(f"[FILE] {name} ({size} bytes)")
-
-        log_audit("hdfs_list", user, context)
         return "\n".join(result) if result else "Папка пуста."
-    except Exception as e:
-        log_audit("hdfs_list", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка HDFS: {str(e)}"
+
+    return hdfs_operation("hdfs_list", _op, user, context, deadline_seconds=60)
 
 
 @mcp.tool()
 def hdfs_stat(path: str) -> str:
     user = HDFS_USER
     context = {"path": path}
-    
-    try:
+
+    def _op():
         client = get_hdfs_client()
         status = client.status(path, strict=False)
-
         if status is None:
-            log_audit("hdfs_stat", user, context, status="NOT_FOUND")
             return f"Путь '{path}' не существует в HDFS."
-
         result = [
             f"Path: {status.get('pathSuffix', path)}",
             f"Type: {status.get('type', 'UNKNOWN')}",
@@ -114,96 +289,74 @@ def hdfs_stat(path: str) -> str:
             f"Access Time: {status.get('accessTime', 'N/A')}",
             f"Modification Time: {status.get('modificationTime', 'N/A')}",
         ]
-
-        log_audit("hdfs_stat", user, context)
         return "\n".join(result)
-    except Exception as e:
-        log_audit("hdfs_stat", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка HDFS: {str(e)}"
+
+    return hdfs_operation("hdfs_stat", _op, user, context, deadline_seconds=30)
 
 
 @mcp.tool()
 def hdfs_mkdir(path: str) -> str:
     user = HDFS_USER
     context = {"path": path}
-    
-    try:
+
+    def _op():
         client = get_hdfs_client()
         client.makedirs(path)
-        log_audit("hdfs_mkdir", user, context)
         return f"Директория '{path}' успешно создана в HDFS."
-    except Exception as e:
-        log_audit("hdfs_mkdir", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка создания: {str(e)}"
+
+    return hdfs_operation("hdfs_mkdir", _op, user, context, deadline_seconds=60)
 
 
 @mcp.tool()
 def hdfs_chmod(path: str, permission: str) -> str:
     user = HDFS_USER
     context = {"path": path, "permission": permission}
-    
-    try:
+
+    before_status = get_hdfs_status(path)
+    before_permission = before_status.get('permission', 'UNKNOWN') if before_status else 'UNKNOWN'
+
+    def _op():
         client = get_hdfs_client()
-        
-        before_status = get_hdfs_status(path)
-        before_permission = before_status.get('permission', 'UNKNOWN') if before_status else 'UNKNOWN'
-        
         client.set_permission(path, permission)
-        
+        return f"Права доступа изменены: {path} -> {permission}"
+
+    def _diff():
         after_status = get_hdfs_status(path)
         after_permission = after_status.get('permission', 'UNKNOWN') if after_status else 'UNKNOWN'
-        
-        permission_diff = {
-            "path": path,
-            "before": before_permission,
-            "after": after_permission
-        }
-        
-        log_audit("hdfs_chmod", user, context, permission_diff=permission_diff)
-        return f"Права доступа изменены: {path} -> {permission}"
-    except Exception as e:
-        log_audit("hdfs_chmod", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка изменения прав: {str(e)}"
+        return {"path": path, "before": before_permission, "after": after_permission}
+
+    return hdfs_operation("hdfs_chmod", _op, user, context, permission_diff_fn=_diff, deadline_seconds=60)
 
 
 @mcp.tool()
 def hdfs_chown(path: str, owner: str, group: str = None) -> str:
     user = HDFS_USER
     context = {"path": path, "owner": owner, "group": group}
-    
-    try:
+
+    before_status = get_hdfs_status(path)
+    before_owner = before_status.get('owner', 'UNKNOWN') if before_status else 'UNKNOWN'
+    before_group = before_status.get('group', 'UNKNOWN') if before_status else 'UNKNOWN'
+
+    def _op():
         client = get_hdfs_client()
-        
-        before_status = get_hdfs_status(path)
-        before_owner = before_status.get('owner', 'UNKNOWN') if before_status else 'UNKNOWN'
-        before_group = before_status.get('group', 'UNKNOWN') if before_status else 'UNKNOWN'
-        
-        if group:
-            new_owner = f"{owner}:{group}"
-        else:
-            new_owner = owner
-        
+        new_owner = f"{owner}:{group}" if group else owner
         client.set_owner(path, new_owner)
-        
+        if group:
+            return f"Владелец и группа изменены: {path} -> {owner}:{group}"
+        return f"Владелец изменён: {path} -> {owner}"
+
+    def _diff():
         after_status = get_hdfs_status(path)
         after_owner = after_status.get('owner', 'UNKNOWN') if after_status else 'UNKNOWN'
         after_group = after_status.get('group', 'UNKNOWN') if after_status else 'UNKNOWN'
-        
-        permission_diff = {
+        return {
             "path": path,
             "owner": {"before": before_owner, "after": after_owner},
-            "group": {"before": before_group, "after": after_group}
+            "group": {"before": before_group, "after": after_group},
         }
-        
-        log_audit("hdfs_chown", user, context, permission_diff=permission_diff)
-        
-        if group:
-            return f"Владелец и группа изменены: {path} -> {owner}:{group}"
-        else:
-            return f"Владелец изменён: {path} -> {owner}"
-    except Exception as e:
-        log_audit("hdfs_chown", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка изменения владельца: {str(e)}"
+
+    return hdfs_operation("hdfs_chown", _op, user, context, permission_diff_fn=_diff, deadline_seconds=60)
+
 
 @mcp.tool()
 def hdfs_setquota(
@@ -213,60 +366,58 @@ def hdfs_setquota(
 ) -> str:
     """Устанавливает квоту на директорию в HDFS."""
     user = HDFS_USER
-    context = {
-        "path": path,
-        "namespace_quota": namespace_quota,
-        "space_quota": space_quota
-    }
-    
-    try:
-        if namespace_quota is None and space_quota is None:
-            log_audit("hdfs_setquota", user, context, status="INVALID_ARGS")
-            return "Укажите namespace_quota и/или space_quota."
+    context = {"path": path, "namespace_quota": namespace_quota, "space_quota": space_quota}
 
-        # Получаем текущие квоты для аудита (до изменений)
+    if namespace_quota is None and space_quota is None:
+        log_audit("hdfs_setquota", user, context, status="INVALID_ARGS")
+        return "Укажите namespace_quota и/или space_quota."
+
+    def _op():
         before_output = run_hdfs_command(["hdfs", "dfs", "-count", "-q", path])
         before_values = before_output.split()[:4] if not before_output.startswith("Ошибка") else ["unknown"] * 4
 
-        # Namespace quota
         if namespace_quota is not None:
-            result = run_hdfs_command([
-                "hdfs", "dfsadmin",
-                "-setQuota", str(namespace_quota),
-                path
-            ])
+            result = run_hdfs_command(["hdfs", "dfsadmin", "-setQuota", str(namespace_quota), path])
             if result.startswith("Ошибка"):
-                log_audit("hdfs_setquota", user, context, status=f"ERROR: {result}")
-                return result
+                raise RuntimeError(result)
 
-        # Space quota
         if space_quota is not None:
-            result = run_hdfs_command([
-                "hdfs", "dfsadmin",
-                "-setSpaceQuota", str(space_quota),
-                path
-            ])
+            result = run_hdfs_command(["hdfs", "dfsadmin", "-setSpaceQuota", str(space_quota), path])
             if result.startswith("Ошибка"):
-                log_audit("hdfs_setquota", user, context, status=f"ERROR: {result}")
-                return result
+                raise RuntimeError(result)
 
-        # Получаем новые квоты для аудита (после изменений)
         after_output = run_hdfs_command(["hdfs", "dfs", "-count", "-q", path])
         after_values = after_output.split()[:4] if not after_output.startswith("Ошибка") else ["unknown"] * 4
 
-        permission_diff = {
-            "path": path,
-            "namespace_quota": {"before": before_values[0], "after": namespace_quota},
-            "space_quota": {"before": before_values[2], "after": space_quota}
+        return {
+            "message": f"Квота установлена для {path}: namespace={namespace_quota}, space={space_quota}",
+            "permission_diff": {
+                "path": path,
+                "namespace_quota": {"before": before_values[0], "after": namespace_quota},
+                "space_quota": {"before": before_values[2], "after": space_quota},
+            }
         }
 
-        log_audit("hdfs_setquota", user, context, permission_diff=permission_diff)
+    try:
+        deadline_ts = time.monotonic() + 120
 
-        return (
-            f"Квота установлена для {path}: "
-            f"namespace={namespace_quota}, space={space_quota}"
+        @retry_with_backoff(
+            max_attempts=RETRY_MAX_ATTEMPTS,
+            deadline=deadline_ts,
+            operation_name="hdfs_setquota",
         )
+        def _execute():
+            return _op()
 
+        outcome = _execute()
+        log_audit("hdfs_setquota", user, context, permission_diff=outcome["permission_diff"])
+        return outcome["message"]
+    except DeadlineExceededError as e:
+        log_audit("hdfs_setquota", user, context, status=f"DEADLINE_EXCEEDED")
+        return f"Ошибка: дедлайн превышен. {e}"
+    except RetryExhaustedError as e:
+        log_audit("hdfs_setquota", user, context, status=f"RETRY_EXHAUSTED")
+        return f"Ошибка: все попытки исчерпаны. {e}"
     except Exception as e:
         log_audit("hdfs_setquota", user, context, status=f"ERROR: {str(e)}")
         return f"Ошибка выполнения: {str(e)}"
@@ -277,185 +428,125 @@ def hdfs_getquota(path: str) -> str:
     """Получает информацию о квотах директории в HDFS."""
     user = HDFS_USER
     context = {"path": path}
-    
-    try:
-        output = run_hdfs_command([
-            "hdfs", "dfs",
-            "-count", "-q",
-            path
-        ])
 
+    def _op():
+        output = run_hdfs_command(["hdfs", "dfs", "-count", "-q", path])
         if output.startswith("Ошибка"):
-            log_audit("hdfs_getquota", user, context, status=f"ERROR: {output}")
-            return output
-
+            raise RuntimeError(output)
         parts = output.split()
-
         if len(parts) < 8:
-            log_audit("hdfs_getquota", user, context, status="INVALID_OUTPUT")
-            return f"Неожиданный формат вывода:\n{output}"
-
-        quota = parts[0]
-        remaining_quota = parts[1]
-        space_quota = parts[2]
-        remaining_space = parts[3]
-        dir_count = parts[4]
-        file_count = parts[5]
-        content_size = parts[6]
+            raise RuntimeError(f"Неожиданный формат вывода:\n{output}")
 
         def normalize(value):
             return "Not set" if value == "none" else value
 
-        log_audit("hdfs_getquota", user, context)
-
         return (
             f"Path: {path}\n"
-            f"Namespace Quota: {normalize(quota)}\n"
-            f"Remaining Namespace: {normalize(remaining_quota)}\n"
-            f"Space Quota: {normalize(space_quota)}\n"
-            f"Remaining Space: {normalize(remaining_space)}\n"
-            f"Directories: {dir_count}\n"
-            f"Files: {file_count}\n"
-            f"Content Size: {content_size} bytes"
+            f"Namespace Quota: {normalize(parts[0])}\n"
+            f"Remaining Namespace: {normalize(parts[1])}\n"
+            f"Space Quota: {normalize(parts[2])}\n"
+            f"Remaining Space: {normalize(parts[3])}\n"
+            f"Directories: {parts[4]}\n"
+            f"Files: {parts[5]}\n"
+            f"Content Size: {parts[6]} bytes"
         )
 
-    except Exception as e:
-        log_audit("hdfs_getquota", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка выполнения: {str(e)}"
-    
+    return hdfs_operation("hdfs_getquota", _op, user, context, deadline_seconds=60)
+
+
 @mcp.tool()
 def hdfs_upload(local_path: str, hdfs_path: str) -> str:
     user = HDFS_USER
     context = {"local_path": local_path, "hdfs_path": hdfs_path}
-    
-    try:
-        client = get_hdfs_client()
-        if not Path(local_path).exists():
-            log_audit("hdfs_upload", user, context, status="NOT_FOUND")
-            return f"Ошибка: Локальный файл '{local_path}' не найден."
 
+    if not Path(local_path).exists():
+        log_audit("hdfs_upload", user, context, status="NOT_FOUND")
+        return f"Ошибка: Локальный файл '{local_path}' не найден."
+
+    def _op():
+        client = get_hdfs_client()
         client.upload(hdfs_path, local_path, overwrite=True)
-        log_audit("hdfs_upload", user, context)
         return f"Файл загружен: {local_path} -> {hdfs_path}"
-    except Exception as e:
-        log_audit("hdfs_upload", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка загрузки: {str(e)}"
+
+    return hdfs_operation("hdfs_upload", _op, user, context, deadline_seconds=300)
 
 
 @mcp.tool()
 def hdfs_download(hdfs_path: str, local_path: str) -> str:
     user = HDFS_USER
     context = {"hdfs_path": hdfs_path, "local_path": local_path}
-    
-    try:
+
+    def _op():
         client = get_hdfs_client()
         client.download(hdfs_path, local_path, overwrite=True)
-        log_audit("hdfs_download", user, context)
         return f"Файл скачан: {hdfs_path} -> {local_path}"
-    except Exception as e:
-        log_audit("hdfs_download", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка скачивания: {str(e)}"
+
+    return hdfs_operation("hdfs_download", _op, user, context, deadline_seconds=300)
 
 
 @mcp.tool()
 def hdfs_snapshot_create(path: str, snapshot_name: str) -> str:
     user = HDFS_USER
     context = {"path": path, "snapshot_name": snapshot_name}
-    
-    try:
+
+    def _op():
         client = get_hdfs_client()
-        
         status = client.status(path, strict=False)
         if status is None:
-            log_audit("hdfs_snapshot_create", user, context, status="NOT_FOUND")
-            return f"Ошибка: Путь '{path}' не существует."
-        
+            raise ValueError(f"Путь '{path}' не существует.")
         if status['type'] != 'DIRECTORY':
-            log_audit("hdfs_snapshot_create", user, context, status="INVALID_PATH")
-            return f"Ошибка: Snapshot можно создать только для директории."
-        
+            raise ValueError("Snapshot можно создать только для директории.")
         client.create_snapshot(path, snapshot_name)
-        log_audit("hdfs_snapshot_create", user, context)
         return f"Snapshot '{snapshot_name}' создан для '{path}'"
-    except Exception as e:
-        log_audit("hdfs_snapshot_create", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка создания snapshot: {str(e)}"
+
+    return hdfs_operation("hdfs_snapshot_create", _op, user, context, deadline_seconds=60)
 
 
 @mcp.tool()
 def hdfs_snapshot_delete(path: str, snapshot_name: str) -> str:
     user = HDFS_USER
     context = {"path": path, "snapshot_name": snapshot_name}
-    
-    try:
+
+    def _op():
         client = get_hdfs_client()
-        
         status = client.status(path, strict=False)
         if status is None:
-            log_audit("hdfs_snapshot_delete", user, context, status="NOT_FOUND")
-            return f"Ошибка: Путь '{path}' не существует."
-        
+            raise ValueError(f"Путь '{path}' не существует.")
         client.delete_snapshot(path, snapshot_name)
-        log_audit("hdfs_snapshot_delete", user, context)
         return f"Snapshot '{snapshot_name}' удалён из '{path}'"
-    except Exception as e:
-        log_audit("hdfs_snapshot_delete", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка удаления snapshot: {str(e)}"
 
-
-def run_hdfs_command(command):
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "-it", "hdfs-namenode"] + command,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        return result.stdout.strip() if result.returncode == 0 else f"Ошибка: {result.stderr.strip()}"
-    except subprocess.TimeoutExpired:
-        return "Ошибка: Превышено время выполнения команды"
-    except Exception as e:
-        return f"Ошибка выполнения: {str(e)}"
+    return hdfs_operation("hdfs_snapshot_delete", _op, user, context, deadline_seconds=60)
 
 
 @mcp.tool()
 def hdfs_balancer_trigger(threshold: int = 10) -> str:
     user = HDFS_USER
     context = {"threshold": threshold}
-    
-    try:
-        command = ["hdfs", "balancer", "-threshold", str(threshold)]
-        output = run_hdfs_command(command)
-        
-        if "Ошибка" in output:
-            log_audit("hdfs_balancer_trigger", user, context, status="ERROR")
-            return output
-        
-        log_audit("hdfs_balancer_trigger", user, context)
+
+    def _op():
+        output = run_hdfs_command(["hdfs", "balancer", "-threshold", str(threshold)])
+        if output.startswith("Ошибка"):
+            raise RuntimeError(output)
         return f"Балансировщик запущен с порогом {threshold}%. {output}"
-    except Exception as e:
-        log_audit("hdfs_balancer_trigger", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка запуска балансировщика: {str(e)}"
+
+    return hdfs_operation("hdfs_balancer_trigger", _op, user, context, deadline_seconds=600)
 
 
 @mcp.tool()
 def hdfs_balancer_status() -> str:
     user = HDFS_USER
     context = {}
-    
-    try:
-        command = ["jps", "-m"]
-        output = run_hdfs_command(command)
-        
+
+    def _op():
+        output = run_hdfs_command(["jps", "-m"])
         if "Balancer" in output:
-            log_audit("hdfs_balancer_status", user, context, status="BALANCER_RUNNING")
             return "Статус: Балансировщик запущен\n\n" + output
-        else:
-            log_audit("hdfs_balancer_status", user, context, status="BALANCER_IDLE")
-            return "Статус: Балансировщик не активен\n\nДля проверки использования дисков:\n" + run_hdfs_command(["hdfs", "dfsadmin", "-report"])
-    except Exception as e:
-        log_audit("hdfs_balancer_status", user, context, status=f"ERROR: {str(e)}")
-        return f"Ошибка проверки статуса: {str(e)}"
+        return (
+            "Статус: Балансировщик не активен\n\nДля проверки использования дисков:\n"
+            + run_hdfs_command(["hdfs", "dfsadmin", "-report"])
+        )
+
+    return hdfs_operation("hdfs_balancer_status", _op, user, context, deadline_seconds=60)
 
 
 if __name__ == "__main__":
