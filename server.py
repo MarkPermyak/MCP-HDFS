@@ -119,101 +119,86 @@ def hdfs_chown(path: str, owner: str, group: str = None) -> str:
     except Exception as e:
         return f"Ошибка изменения владельца: {str(e)}"
 
-# @mcp.tool()
-# def hdfs_setquota(
-#     path: str,
-#     namespace_quota: int | None = None,
-#     space_quota: int | None = None
-# ) -> str:
-#     """
-#     Устанавливает квоту на директорию в HDFS.
+@mcp.tool()
+def hdfs_setquota(
+    path: str,
+    namespace_quota: int | None = None,
+    space_quota: str | None = None
+):
+    try:
+        if namespace_quota is None and space_quota is None:
+            return "Укажите namespace_quota и/или space_quota."
 
-#     Args:
-#         path: Путь к директории в HDFS
-#         namespace_quota: Квота на количество объектов (файлы + директории)
-#         space_quota: Квота на занимаемое пространство в байтах
-#     """
-#     try:
-#         client = get_hdfs_client()
+        # Namespace quota
+        if namespace_quota is not None:
+            result = run_hdfs_command([
+                "hdfs", "dfsadmin",
+                "-setQuota", str(namespace_quota),
+                path
+            ])
+            if result.startswith("Ошибка"):
+                return result
 
-#         if namespace_quota is None and space_quota is None:
-#             return "Необходимо указать хотя бы одну квоту: namespace_quota или space_quota."
-        
-#         if not path.startswith("/"):
-#             path = "/" + path
+        # Space quota
+        if space_quota is not None:
+            result = run_hdfs_command([
+                "hdfs", "dfsadmin",
+                "-setSpaceQuota", str(space_quota),
+                path
+            ])
+            if result.startswith("Ошибка"):
+                return result
 
-#         url = f"{HDFS_NAMENODE}/webhdfs/v1{path}"
+        return (
+            f"Квота установлена для {path}: "
+            f"namespace={namespace_quota}, space={space_quota}"
+        )
 
-#         if namespace_quota is not None:
-#             client._request(
-#                 method="PUT",
-#                 url=url,
-#                 params={
-#                     "op": "SETQUOTA",
-#                     "quota": namespace_quota
-#                 }
-#             )
+    except Exception as e:
+        return f"Ошибка выполнения: {str(e)}"
 
-#         if space_quota is not None:
-#             client._request(
-#                 method="PUT",
-#                 url=url,
-#                 params={
-#                     "op": "SETSPACEQUOTA",
-#                     "spaceQuota": space_quota
-#                 }
-#             )
+@mcp.tool()
+def hdfs_getquota(path: str):
+    try:
+        output = run_hdfs_command([
+            "hdfs", "dfs",
+            "-count", "-q",
+            path
+        ])
 
-#         return (
-#             f"Квота установлена для '{path}': "
-#             f"namespace={namespace_quota}, space={space_quota}"
-#         )
+        if output.startswith("Ошибка"):
+            return output
+
+        parts = output.split()
+
+        if len(parts) < 8:
+            return f"Неожиданный формат вывода:\n{output}"
+
+        quota = parts[0]
+        remaining_quota = parts[1]
+        space_quota = parts[2]
+        remaining_space = parts[3]
+        dir_count = parts[4]
+        file_count = parts[5]
+        content_size = parts[6]
+
+        def normalize(value):
+            return "Not set" if value == "none" else value
+
+        return (
+            f"Path: {path}\n"
+            f"Namespace Quota: {normalize(quota)}\n"
+            f"Remaining Namespace: {normalize(remaining_quota)}\n"
+            f"Space Quota: {normalize(space_quota)}\n"
+            f"Remaining Space: {normalize(remaining_space)}\n"
+            f"Directories: {dir_count}\n"
+            f"Files: {file_count}\n"
+            f"Content Size: {content_size} bytes"
+        )
+
+    except Exception as e:
+        return f"Ошибка выполнения: {str(e)}"
     
-#     except Exception as e:
-#         return f"Ошибка установки квоты: {str(e)}"
-
-
-# @mcp.tool()
-# def hdfs_getquota(path: str) -> str:
-#     """
-#     Получает информацию о квотах директории в HDFS.
-
-#     Args:
-#         path: Путь к директории в HDFS
-#     """
-#     try:
-#         client = get_hdfs_client()
-
-#         if not path.startswith("/"):
-#             path = "/" + path
-
-#         url = f"{HDFS_NAMENODE}/webhdfs/v1{path}"
-
-#         response = client._request(
-#             method="GET",
-#             url=url,
-#             params={"op": "GETCONTENTSUMMARY"}
-#         )
-
-#         data = response.json()["ContentSummary"]
-
-#         quota = data.get("quota", -1)
-#         space_quota = data.get("spaceQuota", -1)
-
-#         result = [
-#             f"Path: {path}",
-#             f"Namespace Quota: {quota if quota != -1 else 'Not set'}",
-#             f"Space Quota: {space_quota if space_quota != -1 else 'Not set'}",
-#             f"Space Consumed: {data.get('spaceConsumed', 0)} bytes",
-#             f"File Count: {data.get('fileCount', 0)}",
-#             f"Directory Count: {data.get('directoryCount', 0)}",
-#         ]
-
-#         return "\n".join(result)
-
-#     except Exception as e:
-#         return f"Ошибка получения квоты: {str(e)}"
-
 @mcp.tool()
 def hdfs_upload(local_path: str, hdfs_path: str) -> str:
     """Загружает локальный файл в HDFS.
