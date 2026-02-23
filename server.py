@@ -291,5 +291,56 @@ def hdfs_snapshot_delete(path: str, snapshot_name: str) -> str:
     except Exception as e:
         return f"Ошибка удаления snapshot: {str(e)}"
 
+
+def run_hdfs_command(command):
+    """Выполняет HDFS команду через docker exec"""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-it", "hdfs-namenode"] + command,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        return result.stdout.strip() if result.returncode == 0 else f"Ошибка: {result.stderr.strip()}"
+    except subprocess.TimeoutExpired:
+        return "Ошибка: Превышено время выполнения команды"
+    except Exception as e:
+        return f"Ошибка выполнения: {str(e)}"
+
+
+@mcp.tool()
+def hdfs_balancer_trigger(self, threshold: int = 10) -> str:
+    """Запускает балансировщик HDFS для перераспределения блоков между DataNode.
+    
+    Args:
+        threshold: Процент отклонения от среднего использования диска (по умолчанию 10%)
+                   Балансировка начнётся, если узлы отличаются более чем на этот процент.
+    """
+    try:
+        command = ["hdfs", "balancer", "-threshold", str(threshold)]
+        output = run_hdfs_command(command)
+        
+        if "Ошибка" in output:
+            return output
+        
+        return f"Балансировщик запущен с порогом {threshold}%. {output}"
+    except Exception as e:
+        return f"Ошибка запуска балансировщика: {str(e)}"
+
+
+@mcp.tool()
+def hdfs_balancer_status() -> str:
+    """Проверяет статус балансировщика HDFS (запущен ли процесс, прогресс)."""
+    try:
+        command = ["jps", "-m"]
+        output = run_hdfs_command(command)
+        
+        if "Balancer" in output:
+            return "Статус: Балансировщик запущен\n\n" + output
+        else:
+            return "Статус: Балансировщик не активен\n\nДля проверки использования дисков:\n" + run_hdfs_command(["hdfs", "dfsadmin", "-report"])
+    except Exception as e:
+        return f"Ошибка проверки статуса: {str(e)}"
+    
 if __name__ == "__main__":
     mcp.run(transport="sse", host="127.0.0.1", port=8000)
