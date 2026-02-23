@@ -2,6 +2,7 @@ from fastmcp import FastMCP
 from pathlib import Path
 from hdfs import InsecureClient
 import os
+import subprocess
 
 mcp = FastMCP("File System Server")
 
@@ -119,14 +120,132 @@ def hdfs_chown(path: str, owner: str, group: str = None) -> str:
         return f"Ошибка изменения владельца: {str(e)}"
 
 # @mcp.tool()
-# def hdfs_download(hdfs_path: str, local_path: str) -> str:
-#     """Скачивает файл из HDFS на локальную машину."""
+# def hdfs_setquota(
+#     path: str,
+#     namespace_quota: int | None = None,
+#     space_quota: int | None = None
+# ) -> str:
+#     """
+#     Устанавливает квоту на директорию в HDFS.
+
+#     Args:
+#         path: Путь к директории в HDFS
+#         namespace_quota: Квота на количество объектов (файлы + директории)
+#         space_quota: Квота на занимаемое пространство в байтах
+#     """
 #     try:
 #         client = get_hdfs_client()
-#         client.download(hdfs_path, local_path, overwrite=True)
-#         return f"Файл скачан: {hdfs_path} -> {local_path}"
+
+#         if namespace_quota is None and space_quota is None:
+#             return "Необходимо указать хотя бы одну квоту: namespace_quota или space_quota."
+        
+#         if not path.startswith("/"):
+#             path = "/" + path
+
+#         url = f"{HDFS_NAMENODE}/webhdfs/v1{path}"
+
+#         if namespace_quota is not None:
+#             client._request(
+#                 method="PUT",
+#                 url=url,
+#                 params={
+#                     "op": "SETQUOTA",
+#                     "quota": namespace_quota
+#                 }
+#             )
+
+#         if space_quota is not None:
+#             client._request(
+#                 method="PUT",
+#                 url=url,
+#                 params={
+#                     "op": "SETSPACEQUOTA",
+#                     "spaceQuota": space_quota
+#                 }
+#             )
+
+#         return (
+#             f"Квота установлена для '{path}': "
+#             f"namespace={namespace_quota}, space={space_quota}"
+#         )
+    
 #     except Exception as e:
-#         return f"Ошибка скачивания: {str(e)}"
+#         return f"Ошибка установки квоты: {str(e)}"
+
+
+# @mcp.tool()
+# def hdfs_getquota(path: str) -> str:
+#     """
+#     Получает информацию о квотах директории в HDFS.
+
+#     Args:
+#         path: Путь к директории в HDFS
+#     """
+#     try:
+#         client = get_hdfs_client()
+
+#         if not path.startswith("/"):
+#             path = "/" + path
+
+#         url = f"{HDFS_NAMENODE}/webhdfs/v1{path}"
+
+#         response = client._request(
+#             method="GET",
+#             url=url,
+#             params={"op": "GETCONTENTSUMMARY"}
+#         )
+
+#         data = response.json()["ContentSummary"]
+
+#         quota = data.get("quota", -1)
+#         space_quota = data.get("spaceQuota", -1)
+
+#         result = [
+#             f"Path: {path}",
+#             f"Namespace Quota: {quota if quota != -1 else 'Not set'}",
+#             f"Space Quota: {space_quota if space_quota != -1 else 'Not set'}",
+#             f"Space Consumed: {data.get('spaceConsumed', 0)} bytes",
+#             f"File Count: {data.get('fileCount', 0)}",
+#             f"Directory Count: {data.get('directoryCount', 0)}",
+#         ]
+
+#         return "\n".join(result)
+
+#     except Exception as e:
+#         return f"Ошибка получения квоты: {str(e)}"
+
+@mcp.tool()
+def hdfs_upload(local_path: str, hdfs_path: str) -> str:
+    """Загружает локальный файл в HDFS.
+
+    Args:
+        local_path: Путь файлу в локальной директории
+        hdfs_path: Путь файла на hdfs
+    """
+    try:
+        client = get_hdfs_client()
+        if not Path(local_path).exists():
+            return f"Ошибка: Локальный файл '{local_path}' не найден."
+
+        client.upload(hdfs_path, local_path, overwrite=True)
+        return f"Файл загружен: {local_path} -> {hdfs_path}"
+    except Exception as e:
+        return f"Ошибка загрузки: {str(e)}"
+
+@mcp.tool()
+def hdfs_download(hdfs_path: str, local_path: str) -> str:
+    """Скачивает файл из HDFS на локальную машину.
+
+    Args:
+        hdfs_path: Путь файла на hdfs
+        local_path: Путь файлу в локальной директории
+    """
+    try:
+        client = get_hdfs_client()
+        client.download(hdfs_path, local_path, overwrite=True)
+        return f"Файл скачан: {hdfs_path} -> {local_path}"
+    except Exception as e:
+        return f"Ошибка скачивания: {str(e)}"
 
 @mcp.tool()
 def hdfs_snapshot_create(path: str, snapshot_name: str) -> str:
