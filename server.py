@@ -406,7 +406,7 @@ def hdfs_snapshot_delete(path: str, snapshot_name: str) -> str:
 def run_hdfs_command(command):
     try:
         result = subprocess.run(
-            ["docker", "exec", "-it", "hdfs-namenode"] + command,
+            ["docker", "exec", "hdfs-namenode"] + command,
             capture_output=True,
             text=True,
             timeout=300
