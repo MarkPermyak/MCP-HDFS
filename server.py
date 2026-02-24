@@ -277,17 +277,33 @@ def hdfs_stat(path: str) -> str:
         status = client.status(path, strict=False)
         if status is None:
             return f"Путь '{path}' не существует в HDFS."
+        
+        modification_time = status.get('modificationTime', 0)
+        access_time = status.get('accessTime', 0)
+
+        # Конвертируем timestamp в читаемый формат
+        def timestamp_to_readable(tmstmp):
+            if tmstmp and tmstmp > 0:
+                from datetime import datetime
+                return datetime.fromtimestamp(tmstmp / 1000).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                return 'N/A'
+            
+        mod_time_str = timestamp_to_readable(modification_time)
+        acc_time_str = timestamp_to_readable(access_time)
+
+        
         result = [
             f"Path: {status.get('pathSuffix', path)}",
             f"Type: {status.get('type', 'UNKNOWN')}",
             f"Size: {status.get('length', 0)} bytes",
-            f"Replication: {status.get('block_replication', 'N/A')}",
-            f"Block Size: {status.get('blocksize', 'N/A')} bytes",
+            f"Replication: {status.get('replication', 'N/A')}",
+            f"Block Size: {status.get('blockSize', 'N/A')} bytes",
             f"Owner: {status.get('owner', 'N/A')}",
             f"Group: {status.get('group', 'N/A')}",
             f"Permission: {status.get('permission', 'N/A')}",
-            f"Access Time: {status.get('accessTime', 'N/A')}",
-            f"Modification Time: {status.get('modificationTime', 'N/A')}",
+            f"Access Time: {acc_time_str}",
+            f"Modification Time: {mod_time_str}",
         ]
         return "\n".join(result)
 
