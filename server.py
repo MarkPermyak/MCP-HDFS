@@ -180,7 +180,7 @@ def run_hdfs_command(command):
     """Выполняет shell-команду внутри Docker-контейнера namenode."""
     try:
         result = subprocess.run(
-            ["docker", "exec", "-it", "hdfs-namenode"] + command,
+            ["docker", "exec", "hdfs-namenode"] + command,
             capture_output=True,
             text=True,
             timeout=HDFS_CMD_TIMEOUT
